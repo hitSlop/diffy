@@ -35,6 +35,6 @@ Inspected `src/runtime.rs` and `src/socket.rs`.
 
 ## Herdr fallback
 
-Small read-only transport adapter using the same platform forms as Reviewr: UnixStream on Unix, interprocess named pipes on Windows. Explicit endpoint, nonblocking IO, bounded response, total deadline, cancellation checks, and request-id validation. Calls session.snapshot only. Unknown fields are ignored; terminal output and agent state are not used. Reconcile snapshots periodically rather than maintaining agent state or replaying event payloads.
+Small read-only transport adapter using the same platform forms as Reviewr: UnixStream on Unix, interprocess named pipes on Windows. Explicit endpoint, nonblocking IO, bounded response, total deadline, cancellation checks, and request-id validation. Calls session.snapshot only. Unknown fields are ignored; terminal output and agent state are not used. Each explicit import scan requests a snapshot; there is no background source watcher or automatic import. Saved session modification times provide activity ordering for live results when available; polling never counts as new activity.
 
 The discovery subsystem cross-compiles for x86_64-pc-windows-gnu. This does not constitute a Windows GUI runtime test.

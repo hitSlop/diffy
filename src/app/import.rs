@@ -11,7 +11,6 @@ use gpui_kit::component::{VirtualListScrollHandle, scroll::ScrollableElement as 
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
-    group_box::GroupBox,
     tooltip::Tooltip,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -27,14 +26,16 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 pub(super) struct Runtime {
     pub preferences: discovery::Preferences,
     pub snapshot: Arc<Snapshot>,
     pub picker: Option<Entity<Picker>>,
-    pub requested: bool,
+    pub generation: u64,
+    scanner: Option<discovery::Scanner>,
+    #[cfg(feature = "ui-tests")]
+    fixture: Option<Snapshot>,
     pub loading: bool,
     pub cancelled: Arc<AtomicBool>,
     pub task: Option<gpui_kit::Task<()>>,
@@ -45,7 +46,10 @@ impl Default for Runtime {
             preferences: Default::default(),
             snapshot: Arc::new(Snapshot::default()),
             picker: None,
-            requested: false,
+            generation: 0,
+            scanner: None,
+            #[cfg(feature = "ui-tests")]
+            fixture: None,
             loading: false,
             cancelled: Arc::new(AtomicBool::new(false)),
             task: None,
@@ -58,12 +62,6 @@ impl Drop for Runtime {
     }
 }
 
-#[derive(Clone)]
-enum Row {
-    Header(Source),
-    Project(usize, Source),
-    Empty(Source),
-}
 pub(super) struct Picker {
     owner: WeakEntity<Diffy>,
     focus: FocusHandle,
@@ -71,10 +69,9 @@ pub(super) struct Picker {
     existing: BTreeSet<PathBuf>,
     selected: BTreeSet<PathBuf>,
     seen: BTreeSet<PathBuf>,
-    automatic: [bool; 3],
+    excluded_repositories: BTreeSet<PathBuf>,
     loading: bool,
     scroll: VirtualListScrollHandle,
-    rows: Arc<Vec<Row>>,
     sizes: Rc<Vec<gpui_kit::Size<gpui_kit::Pixels>>>,
 }
 impl Picker {
@@ -91,67 +88,31 @@ impl Picker {
             if self.seen.insert(candidate.path.clone())
                 && candidate.error.is_none()
                 && !self.existing.contains(&candidate.path)
+                && !candidate
+                    .repository
+                    .as_ref()
+                    .is_some_and(|r| self.excluded_repositories.contains(r))
             {
                 self.selected.insert(candidate.path.clone());
             }
         }
         self.snapshot = snapshot;
         self.loading = loading;
-        let mut rows = Vec::new();
-        let mut sizes = Vec::new();
-        for source in Source::ALL {
-            rows.push(Row::Header(source));
-            sizes.push(size(
-                px(600.),
-                px(if self.snapshot.errors[source.index()].is_some() {
-                    112.
-                } else {
-                    84.
-                }),
-            ));
-            let mut count = 0;
-            let mut candidates: Vec<_> = self
-                .snapshot
-                .candidates
-                .iter()
-                .enumerate()
-                .filter(|(_, candidate)| candidate.sources.contains(&source))
-                .collect();
-            candidates.sort_by_key(|(_, candidate)| {
-                (
-                    std::cmp::Reverse(candidate.created_at),
-                    candidate.name().to_lowercase(),
-                    &candidate.path,
-                )
-            });
-            for (ix, _) in candidates {
-                rows.push(Row::Project(ix, source));
-                sizes.push(size(px(600.), px(60.)));
-                count += 1;
-            }
-            if count == 0 {
-                rows.push(Row::Empty(source));
-                sizes.push(size(px(600.), px(36.)));
-            }
-        }
-        self.rows = Arc::new(rows);
-        self.sizes = Rc::new(sizes);
+        self.sizes = Rc::new(vec![
+            size(px(600.), px(60.));
+            self.snapshot.candidates.len()
+        ]);
     }
     fn finish(&mut self, apply: bool, window: &mut Window, cx: &mut Context<Self>) {
         let selected = self.selected.clone();
-        let automatic = self.automatic;
         let snapshot = self.snapshot.clone();
         let _ = self.owner.update(cx, |this, cx| {
-            this.finish_import(apply, selected, automatic, &snapshot, window, cx)
+            this.finish_import(apply, selected, &snapshot, window, cx)
         });
     }
-    fn render_project(&self, ix: usize, source: Source, cx: &mut Context<Self>) -> AnyElement {
+    fn render_project(&self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let candidate = &self.snapshot.candidates[ix];
-        let row_id = if candidate.section() == source {
-            ix.to_string()
-        } else {
-            format!("{ix}-{}", source.index())
-        };
+        let row_id = candidate.path.to_string_lossy();
         let path = candidate.path.clone();
         let tooltip = path.display().to_string();
         let row_path = path.clone();
@@ -209,24 +170,7 @@ impl Picker {
                     .flex_1()
                     .min_w_0()
                     .gap_1()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(div().font_medium().child(candidate.name()))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        candidate
-                                            .sources
-                                            .iter()
-                                            .map(|s| s.label())
-                                            .collect::<Vec<_>>()
-                                            .join(" · "),
-                                    ),
-                            ),
-                    )
+                    .child(div().font_medium().truncate().child(candidate.name()))
                     .child(
                         div()
                             .truncate()
@@ -256,7 +200,19 @@ impl Picker {
 }
 impl Render for Picker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = self.rows.clone();
+        let status = if self.loading {
+            "Pulling latest projects from Herdr, Codex, and Claude Code…".into()
+        } else {
+            format!(
+                "{} project{} found · Most recently updated first",
+                self.snapshot.candidates.len(),
+                if self.snapshot.candidates.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        };
         v_flex()
             .id("import-picker")
             .test_support()
@@ -269,6 +225,26 @@ impl Render for Picker {
                     .text_color(cx.theme().muted_foreground)
                     .child("Choose local Git projects to add to Diffy."),
             )
+            .child(
+                div()
+                    .id("import-status")
+                    .test_support()
+                    .role(gpui_kit::Role::Status)
+                    .aria_label(status.clone())
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(status),
+            )
+            .children(Source::ALL.into_iter().filter_map(|source| {
+                self.snapshot.errors[source.index()].as_ref().map(|error| {
+                    div()
+                        .id(format!("import-error-{}", source.index()))
+                        .test_support()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("{}: {error}", source.label()))
+                })
+            }))
             .child(
                 h_flex()
                     .gap_2()
@@ -309,64 +285,69 @@ impl Render for Picker {
                             .label("Refresh")
                             .disabled(self.loading)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let _ = this.owner.update(cx, |owner, cx| {
-                                    owner.request_import_scan(cx);
+                                if this.loading {
+                                    return;
+                                }
+                                this.loading = true;
+                                cx.notify();
+                                let owner = this.owner.clone();
+                                let picker = cx.entity().downgrade();
+                                // The parent updates this picker when a scan starts. Wait
+                                // until the click handler has released its entity lease.
+                                cx.defer(move |cx| {
+                                    let _ =
+                                        owner.update(cx, |owner, cx| {
+                                            if owner.import.picker.as_ref().is_some_and(|p| {
+                                                p.entity_id() == picker.entity_id()
+                                            }) {
+                                                owner.request_import_scan(cx);
+                                            }
+                                        });
                                 });
                             })),
                     ),
             )
             .child(
-                div().id("import-scroll").test_support().relative().flex_none().min_h_0()
-                    .h(px((f32::from(window.viewport_size().height) * 0.52).min(460.)))
-                    .child(v_virtual_list(
-                    cx.entity(),
-                    "import-results",
-                    self.sizes.clone(),
-                    move |this, range, _, cx| {
-                        range
-                            .map(|ix| match rows[ix] {
-                                Row::Header(source) => {
-                                    let error = this.snapshot.errors[source.index()].clone();
-                                    GroupBox::new()
-                                        .title(source.label())
-                                        .w_full()
-                                        .mt_3()
-                                        .child(
-                                            div().id(format!("import-auto-{}",source.index())).test_support().child(Checkbox::new(("auto-import", source.index()))
-                                                .label("Automatically add new projects")
-                                                .accessibility_label(format!("Automatically add new {} projects",source.label()))
-                                                .checked(this.automatic[source.index()])
-                                                .on_change(cx.listener(
-                                                    move |this, checked: &bool, _, cx| {
-                                                        this.automatic[source.index()] = *checked;
-                                                        cx.notify();
-                                                    },
-                                                ))),
-                                        )
-                                        .children(error.map(|e| {
-                                            div().text_xs().text_color(cx.theme().muted_foreground).child(e)
-                                        }))
-                                        .into_any_element()
-                                }
-                                Row::Project(candidate, source) => this.render_project(candidate, source, cx),
-                                Row::Empty(source) => div()
-                                    .pl_2()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if this.loading {
-                                        "Looking for projects…"
-                                    } else if this.snapshot.errors[source.index()].is_some() {
-                                        "No readable projects found."
-                                    } else {
-                                        "No projects found."
-                                    })
-                                    .into_any_element(),
-                            })
-                            .collect::<Vec<_>>()
-                    },
-                )
-                .track_scroll(&self.scroll)
-                .size_full()).vertical_scrollbar(&self.scroll),
+                div()
+                    .id("import-scroll")
+                    .test_support()
+                    .relative()
+                    .flex_none()
+                    .min_h_0()
+                    .h(px(
+                        (f32::from(window.viewport_size().height) * 0.52).min(460.)
+                    ))
+                    .when(self.snapshot.candidates.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .px_2()
+                                .py_3()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if self.loading {
+                                    "Looking for projects…"
+                                } else {
+                                    "No projects found."
+                                }),
+                        )
+                    })
+                    .when(!self.snapshot.candidates.is_empty(), |d| {
+                        d.child(
+                            v_virtual_list(
+                                cx.entity(),
+                                "import-results",
+                                self.sizes.clone(),
+                                |this, range, _, cx| {
+                                    range
+                                        .map(|ix| this.render_project(ix, cx))
+                                        .collect::<Vec<_>>()
+                                },
+                            )
+                            .track_scroll(&self.scroll)
+                            .size_full(),
+                        )
+                        .vertical_scrollbar(&self.scroll)
+                    }),
             )
             .child(
                 h_flex()
@@ -414,8 +395,8 @@ impl Diffy {
         let existing = self.project_paths();
         let owner = cx.entity().downgrade();
         let snapshot = self.import.snapshot.clone();
-        let automatic = self.import.preferences.automatic;
         let excluded = self.import.preferences.excluded.clone();
+        let excluded_repositories = self.import.preferences.excluded_repositories.clone();
         let picker = cx.new(|cx| {
             let mut picker = Picker {
                 owner,
@@ -424,10 +405,9 @@ impl Diffy {
                 existing: BTreeSet::new(),
                 selected: BTreeSet::new(),
                 seen: excluded,
-                automatic,
+                excluded_repositories,
                 loading: true,
                 scroll: VirtualListScrollHandle::new(),
-                rows: Arc::new(Vec::new()),
                 sizes: Rc::new(Vec::new()),
             };
             picker.install(snapshot, existing, true);
@@ -447,6 +427,7 @@ impl Diffy {
                 .content(move |content, _, _| content.child(picker.clone()))
                 .on_close(move |_, window, cx| {
                     let _ = owner.update(cx, |this, cx| {
+                        this.cancel_import_scan();
                         this.import.picker = None;
                         this.import.preferences.onboarding_completed = true;
                         this.persist(cx);
@@ -456,32 +437,72 @@ impl Diffy {
                 })
         });
         self.request_import_scan(cx);
-        if self.import.task.is_none() {
-            self.start_discovery(window, cx);
-        }
     }
-    pub(super) fn request_import_scan(&mut self, cx: &mut Context<Self>) {
-        self.import.requested = true;
+    fn cancel_import_scan(&mut self) {
+        self.import.cancelled.store(true, Ordering::Relaxed);
+        self.import.generation += 1;
+        self.import.task = None;
+        self.import.loading = false;
+    }
+    fn request_import_scan(&mut self, cx: &mut Context<Self>) {
+        if self.import.loading || self.import.picker.is_none() {
+            return;
+        }
         self.import.loading = true;
+        self.import.generation += 1;
+        let generation = self.import.generation;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.import.cancelled = cancelled.clone();
         if let Some(picker) = &self.import.picker {
             picker.update(cx, |p, cx| {
                 p.loading = true;
                 cx.notify();
             });
         }
+        let mut scanner = self.import.scanner.take().unwrap_or_default();
+        let locations = discovery::Locations::from_env();
+        #[cfg(feature = "ui-tests")]
+        let fixture = self.import.fixture.clone();
+        self.import.task = Some(cx.spawn(async move |owner, cx| {
+            let (scanner, snapshot) = cx
+                .background_spawn(async move {
+                    #[cfg(feature = "ui-tests")]
+                    if let Some(snapshot) = fixture {
+                        return (scanner, snapshot);
+                    }
+                    let snapshot = scanner.scan(&locations, [true; 3], &cancelled);
+                    (scanner, snapshot)
+                })
+                .await;
+            let _ = owner.update(cx, |this, cx| {
+                this.complete_import_scan(generation, scanner, snapshot, cx);
+            });
+        }));
         cx.notify();
+    }
+    fn complete_import_scan(
+        &mut self,
+        generation: u64,
+        scanner: discovery::Scanner,
+        snapshot: Snapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.import.generation || self.import.picker.is_none() {
+            return;
+        }
+        self.import.scanner = Some(scanner);
+        self.import.task = None;
+        self.receive_discovery(snapshot, cx);
     }
     pub(super) fn finish_import(
         &mut self,
         apply: bool,
         selected: BTreeSet<PathBuf>,
-        automatic: [bool; 3],
         snapshot: &Snapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if apply {
-            self.import.preferences.automatic = automatic;
             for candidate in &snapshot.candidates {
                 if selected.contains(&candidate.path) {
                     self.import.preferences.excluded.remove(&candidate.path);
@@ -497,6 +518,7 @@ impl Diffy {
             self.import_projects(selected, cx);
         }
         self.import.preferences.onboarding_completed = true;
+        self.cancel_import_scan();
         self.import.picker = None;
         self.persist(cx);
         window.close_dialog(cx);
@@ -522,29 +544,11 @@ impl Diffy {
         self.restoring = was_restoring;
         self.persist(cx);
     }
-    pub(super) fn receive_discovery(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+    fn receive_discovery(&mut self, mut snapshot: Snapshot, cx: &mut Context<Self>) {
+        snapshot.sort();
         let snapshot = Arc::new(snapshot);
         self.import.loading = false;
-        if *self.import.snapshot == *snapshot {
-            if let Some(picker) = &self.import.picker {
-                picker.update(cx, |p, cx| {
-                    p.loading = false;
-                    cx.notify();
-                });
-            }
-            return;
-        }
         self.import.snapshot = snapshot.clone();
-        // While choosing, defer auto-add so existing checkbox rows do not change underneath the user.
-        if self.import.picker.is_none() {
-            let paths = snapshot
-                .candidates
-                .iter()
-                .filter(|c| self.import.preferences.should_add(c))
-                .map(|c| c.path.clone())
-                .collect();
-            self.import_projects(paths, cx);
-        }
         if let Some(picker) = &self.import.picker {
             let existing = self.project_paths();
             picker.update(cx, |p, cx| {
@@ -553,64 +557,6 @@ impl Diffy {
             });
         }
         cx.notify();
-    }
-    pub(super) fn start_discovery(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.import.task.is_some() {
-            return;
-        }
-        let cancelled = self.import.cancelled.clone();
-        let locations = discovery::Locations::from_env();
-        self.import.task = Some(cx.spawn_in(window, async move |owner, cx| {
-            let mut scanner = discovery::Scanner::default();
-            let mut watch = discovery::MetadataWatch::default();
-            let mut next = Instant::now();
-            let mut dirty_since = None;
-            loop {
-                let Ok((enabled, requested, picker)) = owner.update(cx, |this, _| {
-                    let requested = std::mem::take(&mut this.import.requested);
-                    (
-                        this.import.preferences.automatic,
-                        requested,
-                        this.import.picker.is_some(),
-                    )
-                }) else {
-                    break;
-                };
-                if watch.dirty.swap(false, Ordering::Relaxed) && dirty_since.is_none() {
-                    dirty_since = Some(Instant::now());
-                }
-                let dirty = dirty_since
-                    .is_some_and(|time: Instant| time.elapsed() >= Duration::from_secs(2));
-                if requested || (enabled.iter().any(|v| *v) && (dirty || Instant::now() >= next)) {
-                    dirty_since = None;
-                    let scan_sources = if picker { [true; 3] } else { enabled };
-                    let locations = locations.clone();
-                    let cancelled = cancelled.clone();
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            watch.configure(&locations, enabled);
-                            let snapshot = scanner.scan(&locations, scan_sources, &cancelled);
-                            (scanner, watch, snapshot)
-                        })
-                        .await;
-                    scanner = result.0;
-                    watch = result.1;
-                    let _ = owner.update(cx, |this, cx| this.receive_discovery(result.2, cx));
-                    let herdr_live = owner
-                        .read_with(cx, |this, _| this.import.snapshot.herdr_live)
-                        .unwrap_or(false);
-                    next = Instant::now()
-                        + Duration::from_secs(if enabled[0] && herdr_live { 5 } else { 30 });
-                } else {
-                    // Drop disabled watchers promptly, even when there is no scan to run.
-                    watch.configure(&locations, enabled);
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(500))
-                    .await;
-            }
-        }));
     }
 }
 
@@ -622,9 +568,9 @@ impl Diffy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.import.fixture = Some(snapshot.clone());
         self.open_import(window, cx);
-        self.import.task = None;
-        self.import.requested = false;
+        self.cancel_import_scan();
         self.receive_discovery(snapshot, cx);
     }
     pub fn import_selected_count(&self, cx: &gpui_kit::App) -> usize {
@@ -633,11 +579,33 @@ impl Diffy {
             .as_ref()
             .map_or(0, |picker| picker.read(cx).selected.len())
     }
-    pub fn import_automatic(&self, cx: &gpui_kit::App) -> [bool; 3] {
+    pub fn set_import_fixture(&mut self, snapshot: Snapshot) {
+        self.import.fixture = Some(snapshot);
+    }
+    pub fn import_loading(&self, cx: &gpui_kit::App) -> bool {
         self.import
             .picker
             .as_ref()
-            .map_or(self.import.preferences.automatic, |p| p.read(cx).automatic)
+            .is_some_and(|p| p.read(cx).loading)
+    }
+    pub fn import_paths(&self) -> Vec<PathBuf> {
+        self.import
+            .snapshot
+            .candidates
+            .iter()
+            .map(|c| c.path.clone())
+            .collect()
+    }
+    pub fn import_generation(&self) -> u64 {
+        self.import.generation
+    }
+    pub fn complete_import_fixture(
+        &mut self,
+        generation: u64,
+        snapshot: Snapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.complete_import_scan(generation, discovery::Scanner::default(), snapshot, cx);
     }
     pub fn import_is_open(&self) -> bool {
         self.import.picker.is_some()

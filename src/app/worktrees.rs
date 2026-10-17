@@ -2,7 +2,9 @@
 use super::{Diffy, session::Project};
 use crate::{repository, state, watch};
 use gpui_kit::component::{
-    InteractiveElementExt as _, Sizable as _,
+    Disableable as _, InteractiveElementExt as _, Selectable as _, Sizable as _, StyledExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
     tab::{Tab, TabBar},
     tooltip::Tooltip,
 };
@@ -193,6 +195,10 @@ impl Diffy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_pr() {
+            self.move_pr(direction, cx);
+            return;
+        }
         let indices = self
             .worktree_indices(self.active)
             .into_iter()
@@ -234,8 +240,8 @@ impl Diffy {
         }
         for (position, &ix) in indices.iter().enumerate() {
             let p = &self.projects[ix];
-            let label = if position == 0 {
-                name.to_string()
+            let label = if position == 0 && p.branch.as_ref() != "…" {
+                p.branch.to_string()
             } else {
                 self.worktree_label(ix)
             };
@@ -249,51 +255,85 @@ impl Diffy {
                 if p.locked_worktree { " · locked" } else { "" },
                 if p.available { "" } else { " · unavailable" }
             );
-            let mut tab =
-                Tab::new()
-                    .label(label)
-                    .disabled(!p.available)
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(tooltip.clone())
-                            .max_w(px(640.))
-                            .whitespace_normal()
-                            .build(window, cx)
-                    });
-            if position == 0 {
-                let content = match icon {
-                    Some(state::ProjectIcon::Image(path)) => img(path.clone())
-                        .size_full()
-                        .object_fit(ObjectFit::Cover)
-                        .into_any_element(),
-                    Some(state::ProjectIcon::Emoji(emoji)) => {
-                        div().child(emoji.clone()).into_any_element()
-                    }
-                    None => div()
-                        .child(
-                            name.chars()
-                                .next()
-                                .unwrap_or('D')
-                                .to_uppercase()
-                                .to_string(),
-                        )
-                        .into_any_element(),
-                };
-                tab = tab.prefix(
-                    div()
-                        .size(px(18.))
-                        .rounded(px(5.))
-                        .overflow_hidden()
-                        .bg(rgb(color))
-                        .text_color(rgb(0x141618))
-                        .text_size(px(11.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(content),
-                );
-            }
+            let tab = Tab::new()
+                .label(label)
+                .disabled(!p.available)
+                .tooltip(move |window, cx| {
+                    Tooltip::new(tooltip.clone())
+                        .max_w(px(640.))
+                        .whitespace_normal()
+                        .build(window, cx)
+                });
             bar = bar.child(tab);
         }
+        let content = match icon {
+            Some(state::ProjectIcon::Image(path)) => img(path.clone())
+                .size_full()
+                .object_fit(ObjectFit::Cover)
+                .into_any_element(),
+            Some(state::ProjectIcon::Emoji(emoji)) => div().child(emoji.clone()).into_any_element(),
+            None => div()
+                .child(
+                    name.chars()
+                        .next()
+                        .unwrap_or('D')
+                        .to_uppercase()
+                        .to_string(),
+                )
+                .into_any_element(),
+        };
+        let identity = h_flex()
+            .gap_2()
+            .px_2()
+            .max_w(px(180.))
+            .min_w_0()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .size(px(18.))
+                    .flex_shrink_0()
+                    .rounded(px(5.))
+                    .overflow_hidden()
+                    .bg(rgb(color))
+                    .text_color(rgb(0x141618))
+                    .text_size(px(11.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(content),
+            )
+            .child(div().truncate().font_medium().child(name.clone()));
+        let remote = self.is_pr();
+        let ready = self
+            .pr_state()
+            .is_some_and(|s| !s.resolving && !s.remotes.is_empty());
+        let source = h_flex()
+            .flex_shrink_0()
+            .gap_1()
+            .child(
+                Button::new("source-worktrees")
+                    .ghost()
+                    .xsmall()
+                    .label("Worktrees")
+                    .selected(!remote)
+                    .toggled(!remote)
+                    .on_click(cx.listener(|this, _, w, cx| this.set_review_source(false, w, cx))),
+            )
+            .child(
+                Button::new("source-prs")
+                    .ghost()
+                    .xsmall()
+                    .label("Pull requests")
+                    .selected(remote)
+                    .toggled(remote)
+                    .disabled(!ready)
+                    .tooltip(if ready {
+                        "Review open GitHub pull requests"
+                    } else {
+                        "No GitHub remote available · Refresh after adding one"
+                    })
+                    .on_click(cx.listener(|this, _, w, cx| this.set_review_source(true, w, cx))),
+            );
         // Wait for pointer movement before handing the gesture to macOS, so
         // ordinary clicks still reach the tabs and their overflow menu.
         let dragging = Rc::new(Cell::new(false));
@@ -316,11 +356,25 @@ impl Diffy {
                 })
                 .on_double_click(|_, window, _| window.titlebar_double_click())
                 .child(
-                    bar.on_click(cx.listener(move |this, selected: &usize, window, cx| {
-                        if let Some(&ix) = indices.get(*selected) {
-                            this.switch_project(ix, window, cx);
-                        }
-                    })),
+                    h_flex()
+                        .w_full()
+                        .min_w_0()
+                        .h_full()
+                        .gap_2()
+                        .child(identity)
+                        .child(source)
+                        .child(if remote {
+                            self.render_pr_tabs(cx)
+                        } else {
+                            bar.min_w_0()
+                                .flex_1()
+                                .on_click(cx.listener(move |this, selected: &usize, window, cx| {
+                                    if let Some(&ix) = indices.get(*selected) {
+                                        this.switch_project(ix, window, cx);
+                                    }
+                                }))
+                                .into_any_element()
+                        }),
                 )
                 .into_any_element(),
         )

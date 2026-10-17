@@ -92,12 +92,13 @@ impl Diffy {
     }
     pub(super) fn render_palette(&self, cx: &mut Context<Self>) -> AnyElement {
         let p = self.projects.get(self.active);
-        let has_files = p.is_some_and(|p| !p.view().files.is_empty());
-        let mutable = p.is_some_and(|p| {
-            p.path.is_some()
-                && !p.loading
-                && p.view().selected_entry().is_some_and(|e| e.stageable())
-        });
+        let has_files = self.active_view().is_some_and(|v| !v.files.is_empty());
+        let mutable = !self.is_pr()
+            && p.is_some_and(|p| {
+                p.path.is_some()
+                    && !p.loading
+                    && p.view().selected_entry().is_some_and(|e| e.stageable())
+            });
         let projects =
             CommandGroup::new()
                 .label("Projects")
@@ -135,7 +136,11 @@ impl Diffy {
             ),
             item("Install terminal command", Box::new(InstallCli), false),
             item(
-                "Refresh repository",
+                if self.is_pr() {
+                    "Refresh pull requests"
+                } else {
+                    "Refresh repository"
+                },
                 Box::new(Refresh),
                 !p.is_some_and(|p| p.path.is_some() && !p.loading),
             ),
@@ -150,14 +155,30 @@ impl Diffy {
                 self.project_count() < 2,
             ),
             item(
-                "Next worktree",
+                if self.is_pr() {
+                    "Next pull request"
+                } else {
+                    "Next worktree"
+                },
                 Box::new(NextWorktree),
-                self.worktree_indices(self.active).len() < 2,
+                if self.is_pr() {
+                    self.pr_state().is_none_or(|s| s.prs.len() < 2)
+                } else {
+                    self.worktree_indices(self.active).len() < 2
+                },
             ),
             item(
-                "Previous worktree",
+                if self.is_pr() {
+                    "Previous pull request"
+                } else {
+                    "Previous worktree"
+                },
                 Box::new(PreviousWorktree),
-                self.worktree_indices(self.active).len() < 2,
+                if self.is_pr() {
+                    self.pr_state().is_none_or(|s| s.prs.len() < 2)
+                } else {
+                    self.worktree_indices(self.active).len() < 2
+                },
             ),
             item("Next file", Box::new(NextFile), !has_files),
             item("Previous file", Box::new(PreviousFile), !has_files),
@@ -166,7 +187,7 @@ impl Diffy {
             item(
                 "Switch Staged / Changes",
                 Box::new(ToggleGroup),
-                p.is_none(),
+                p.is_none() || self.is_pr(),
             ),
             item("Unified diff", Box::new(UnifiedMode), p.is_none()),
             item("Split diff", Box::new(SplitMode), p.is_none()),
@@ -186,9 +207,12 @@ impl Diffy {
                     "Unstage all files"
                 },
                 Box::new(StageAll),
-                !p.is_some_and(|p| {
-                    p.path.is_some() && !p.loading && p.view().files.iter().any(|e| e.stageable())
-                }),
+                self.is_pr()
+                    || !p.is_some_and(|p| {
+                        p.path.is_some()
+                            && !p.loading
+                            && p.view().files.iter().any(|e| e.stageable())
+                    }),
             ),
             item("Focus diff", Box::new(FocusDiff), !has_files),
             item("Find file", Box::new(FocusFileSearch), p.is_none()),
@@ -200,12 +224,14 @@ impl Diffy {
             item(
                 "Copy absolute path",
                 Box::new(super::CopyAbsolutePath),
-                !p.is_some_and(|p| p.path.is_some() && p.view().selected_entry().is_some()),
+                self.is_pr()
+                    || !p.is_some_and(|p| p.path.is_some() && p.view().selected_entry().is_some()),
             ),
             item(
                 crate::project_apps::reveal_label(),
                 Box::new(super::RevealFile),
-                !p.is_some_and(|p| p.path.is_some() && p.view().selected_entry().is_some()),
+                self.is_pr()
+                    || !p.is_some_and(|p| p.path.is_some() && p.view().selected_entry().is_some()),
             ),
             item(
                 "Increase diff font size",

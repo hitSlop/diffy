@@ -6,10 +6,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -38,20 +35,8 @@ impl Source {
 #[serde(default)]
 pub struct Preferences {
     pub onboarding_completed: bool,
-    pub automatic: [bool; 3],
     pub excluded: BTreeSet<PathBuf>,
     pub excluded_repositories: BTreeSet<PathBuf>,
-}
-impl Preferences {
-    pub fn should_add(&self, candidate: &Candidate) -> bool {
-        candidate.error.is_none()
-            && !self.excluded.contains(&candidate.path)
-            && !candidate
-                .repository
-                .as_ref()
-                .is_some_and(|r| self.excluded_repositories.contains(r))
-            && candidate.sources.iter().any(|s| self.automatic[s.index()])
-    }
 }
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
@@ -59,12 +44,9 @@ pub struct Candidate {
     pub repository: Option<PathBuf>,
     pub sources: BTreeSet<Source>,
     pub error: Option<String>,
-    pub created_at: Option<SystemTime>,
+    pub updated_at: Option<SystemTime>,
 }
 impl Candidate {
-    pub fn section(&self) -> Source {
-        *self.sources.first().expect("candidate has a source")
-    }
     pub fn name(&self) -> String {
         self.path
             .file_name()
@@ -77,7 +59,17 @@ impl Candidate {
 pub struct Snapshot {
     pub candidates: Vec<Candidate>,
     pub errors: [Option<String>; 3],
-    pub herdr_live: bool,
+}
+impl Snapshot {
+    pub(crate) fn sort(&mut self) {
+        self.candidates.sort_by_cached_key(|candidate| {
+            (
+                std::cmp::Reverse(candidate.updated_at),
+                candidate.name().to_lowercase(),
+                candidate.path.clone(),
+            )
+        });
+    }
 }
 #[derive(Clone)]
 pub struct Locations {
@@ -132,33 +124,44 @@ impl Locations {
             errors,
         }
     }
-    pub fn watch_paths(&self, enabled: [bool; 3]) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if enabled[0] {
-            paths.extend(self.herdr.iter().cloned());
-        }
-        if enabled[1]
-            && let Some(p) = &self.codex
-        {
-            paths.extend([p.join("sessions"), p.join("archived_sessions")]);
-        }
-        if enabled[2]
-            && let Some(p) = &self.claude
-        {
-            paths.push(p.join("projects"));
-        }
-        paths
-    }
 }
 
 type Stamp = (u64, Option<SystemTime>);
+
+struct TemporaryRoots(Vec<PathBuf>);
+impl Default for TemporaryRoots {
+    fn default() -> Self {
+        let roots = std::iter::once(std::env::temp_dir());
+        #[cfg(unix)]
+        let roots = roots.chain(["/tmp", "/var/tmp"].map(PathBuf::from));
+        Self::new(roots)
+    }
+}
+impl TemporaryRoots {
+    fn new(roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        let mut paths = BTreeSet::new();
+        for root in roots {
+            if root.is_absolute() {
+                if let Ok(canonical) = fs::canonicalize(&root) {
+                    paths.insert(canonical);
+                }
+                paths.insert(root);
+            }
+        }
+        Self(paths.into_iter().collect())
+    }
+    fn contains(&self, checkout: &Path) -> bool {
+        self.0.iter().any(|root| checkout.starts_with(root))
+    }
+}
+
 #[derive(Default)]
 pub struct Scanner {
     metadata: HashMap<PathBuf, (Stamp, Result<Vec<PathBuf>, ()>)>,
     roots: HashMap<PathBuf, (Instant, Result<PathBuf, String>)>,
     pub metadata_reads: usize,
-    created: HashMap<PathBuf, SystemTime>,
-    herdr_live: bool,
+    updated: HashMap<PathBuf, SystemTime>,
+    temporary_roots: TemporaryRoots,
 }
 impl Scanner {
     fn cached(
@@ -171,26 +174,31 @@ impl Scanner {
             return Err(());
         }
         let stamp = (meta.len(), meta.modified().ok());
-        if let Some((old, result)) = self.metadata.get(path)
+        let result = if let Some((old, result)) = self.metadata.get(path)
             && *old == stamp
         {
-            return result.clone();
+            result.clone()
+        } else {
+            self.metadata_reads += 1;
+            let result = read();
+            self.metadata
+                .insert(path.to_owned(), (stamp, result.clone()));
+            result
+        };
+        if let Ok(paths) = &result {
+            self.record_activity(paths, stamp.1);
         }
-        self.metadata_reads += 1;
-        let result = read();
-        if let Ok(paths) = &result
-            && let Some(created) = meta.created().ok().or_else(|| meta.modified().ok())
-        {
+        result
+    }
+    fn record_activity(&mut self, paths: &[PathBuf], updated: Option<SystemTime>) {
+        if let Some(updated) = updated {
             for path in paths {
-                self.created
+                self.updated
                     .entry(path.clone())
-                    .and_modify(|time| *time = (*time).max(created))
-                    .or_insert(created);
+                    .and_modify(|time| *time = (*time).max(updated))
+                    .or_insert(updated);
             }
         }
-        self.metadata
-            .insert(path.to_owned(), (stamp, result.clone()));
-        result
     }
     pub fn scan(
         &mut self,
@@ -199,6 +207,9 @@ impl Scanner {
         cancelled: &AtomicBool,
     ) -> Snapshot {
         let _span = tracing::info_span!("project_discovery").entered();
+        // Rebuild from the files visited this scan, including cache hits. Removed
+        // history must not leave an old maximum timestamp attached to a project.
+        self.updated.clear();
         let mut raw = Vec::new();
         let mut snapshot = Snapshot::default();
         for source in Source::ALL {
@@ -231,7 +242,7 @@ impl Scanner {
             if !path.is_absolute() {
                 continue;
             }
-            let created_at = self.created.get(&path).copied();
+            let updated_at = self.updated.get(&path).copied();
             let path = fs::canonicalize(&path).unwrap_or(path);
             // Old agent history frequently points at deleted checkouts. Do not clutter the picker.
             if !path.is_dir() {
@@ -261,42 +272,26 @@ impl Scanner {
                 Ok(root) => (root, None),
                 Err(_) => continue,
             };
-            let created_at = created_at.or_else(|| {
-                fs::metadata(&path)
-                    .ok()
-                    .and_then(|m| m.created().ok().or_else(|| m.modified().ok()))
-            });
+            // Filter the resolved checkout, including cache hits: agent histories
+            // also contain disposable evaluation repos and temporary worktrees.
+            if self.temporary_roots.contains(&path) {
+                continue;
+            }
             let candidate = merged.entry(path.clone()).or_insert_with(|| Candidate {
                 repository: crate::repository::common_directory(&path).ok(),
                 path,
                 sources: BTreeSet::new(),
                 error,
-                created_at,
+                updated_at,
             });
-            candidate.created_at = candidate.created_at.max(created_at);
+            candidate.updated_at = candidate.updated_at.max(updated_at);
             candidate.sources.insert(source);
         }
-        snapshot.herdr_live = enabled[0] && self.herdr_live;
         snapshot.candidates = merged.into_values().collect();
-        snapshot.candidates.sort_by_cached_key(|candidate| {
-            (
-                candidate.section(),
-                std::cmp::Reverse(candidate.created_at),
-                candidate.name().to_lowercase(),
-                candidate.path.clone(),
-            )
-        });
+        snapshot.sort();
         if !cancelled.load(Ordering::Relaxed) {
             self.metadata.retain(|path, _| path.is_file());
             self.roots.retain(|path, _| path.is_dir());
-            let referenced: BTreeSet<_> = self
-                .metadata
-                .values()
-                .filter_map(|(_, result)| result.as_ref().ok())
-                .flatten()
-                .cloned()
-                .collect();
-            self.created.retain(|path, _| referenced.contains(path));
         }
         snapshot
     }
@@ -360,7 +355,6 @@ impl Scanner {
         (paths.into_iter().collect(), failures)
     }
     fn herdr(&mut self, locations: &Locations, cancelled: &AtomicBool) -> (Vec<PathBuf>, usize) {
-        self.herdr_live = false;
         let mut sessions: BTreeSet<PathBuf> = locations.herdr.iter().cloned().collect();
         for root in &locations.herdr {
             if let Ok(dirs) = fs::read_dir(root.join("sessions")) {
@@ -404,7 +398,13 @@ impl Scanner {
                 None
             };
             if let Some(items) = result {
-                self.herdr_live = true;
+                // A successful poll is not new project activity. Use the saved
+                // session's timestamp when available, never the scan time.
+                let updated = saved
+                    .as_ref()
+                    .and_then(|p| fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok());
+                self.record_activity(&items, updated);
                 paths.extend(items);
                 continue;
             }
@@ -691,56 +691,6 @@ fn read_herdr_socket(
     }
 }
 
-/// Watch only enabled source metadata. Missing roots are checked by periodic reconciliation.
-pub struct MetadataWatch {
-    pub dirty: Arc<AtomicBool>,
-    watcher: Option<notify::RecommendedWatcher>,
-    paths: Vec<PathBuf>,
-}
-impl Default for MetadataWatch {
-    fn default() -> Self {
-        Self {
-            dirty: Arc::new(AtomicBool::new(false)),
-            watcher: None,
-            paths: Vec::new(),
-        }
-    }
-}
-impl MetadataWatch {
-    pub fn configure(&mut self, locations: &Locations, enabled: [bool; 3]) {
-        use notify::Watcher;
-        let paths: Vec<_> = locations
-            .watch_paths(enabled)
-            .into_iter()
-            .filter(|p| p.is_dir())
-            .collect();
-        if self.paths == paths {
-            return;
-        }
-        self.watcher = None;
-        self.paths = paths.clone();
-        let dirty = self.dirty.clone();
-        if paths.is_empty() {
-            return;
-        }
-        if let Ok(mut watcher) =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if event
-                    .as_ref()
-                    .map_or(true, |e| !matches!(e.kind, notify::EventKind::Access(_)))
-                {
-                    dirty.store(true, Ordering::Relaxed);
-                }
-            })
-        {
-            for path in &paths {
-                let _ = watcher.watch(path, notify::RecursiveMode::Recursive);
-            }
-            self.watcher = Some(watcher);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +735,14 @@ mod tests {
                 errors: [None, None, None],
             }
         }
+        fn scanner(&self) -> Scanner {
+            // Fixtures live in the host's temp directory. Give them their own
+            // temporary root so ordinary fixture projects remain discoverable.
+            Scanner {
+                temporary_roots: TemporaryRoots::new([self.0.join("system-temp")]),
+                ..Scanner::default()
+            }
+        }
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
@@ -793,6 +751,95 @@ mod tests {
     }
     fn codex(path: &Path) -> serde_json::Value {
         serde_json::json!({"type":"session_meta","payload":{"id":"fixture","cwd":path,"source":"cli"}})
+    }
+    #[test]
+    fn default_temporary_roots_hide_platform_temp_and_unix_aliases() {
+        let f = Fixture::new();
+        let root = f.repo("openloop-eval/runs/app");
+        f.write("codex/sessions/temp.jsonl", &codex(&root));
+        assert!(
+            Scanner::default()
+                .scan(&f.locations(), [true; 3], &AtomicBool::new(false))
+                .candidates
+                .is_empty()
+        );
+        #[cfg(unix)]
+        for alias in ["/tmp", "/var/tmp"] {
+            let roots = TemporaryRoots::default();
+            assert!(roots.contains(&Path::new(alias).join("evaluation/app")));
+            if let Ok(canonical) = fs::canonicalize(alias) {
+                assert!(roots.contains(&canonical.join("evaluation/app")));
+            }
+        }
+    }
+    #[test]
+    fn temporary_checkouts_are_hidden_across_sources_and_cached_scans() {
+        let f = Fixture::new();
+        let temporary = f.repo("system-temp/openloop-eval/runs/app");
+        let nested = temporary.join("src");
+        fs::create_dir(&nested).unwrap();
+        let ordinary = f.repo("projects/app");
+        let similar = f.repo("system-temp-project/app");
+        let named_tmp = f.repo("projects/tmp/app");
+        f.write("herdr/session.json", &serde_json::json!({"version":3,"workspaces":[{"identity_cwd":nested,"tabs":[]},{"identity_cwd":ordinary,"tabs":[]}]}));
+        for (name, path) in [
+            ("temporary", &nested),
+            ("ordinary", &ordinary),
+            ("similar", &similar),
+            ("named-tmp", &named_tmp),
+        ] {
+            f.write(&format!("codex/sessions/{name}.jsonl"), &codex(path));
+            f.write(&format!("claude/projects/example/{name}.jsonl"), &serde_json::json!({"type":"user","cwd":path,"sessionId":name,"message":{"content":"ignored"}}));
+        }
+        let mut scanner = f.scanner();
+        let cancel = AtomicBool::new(false);
+        let first = scanner.scan(&f.locations(), [true; 3], &cancel);
+        assert_eq!(
+            first
+                .candidates
+                .iter()
+                .map(|c| c.path.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([ordinary.clone(), similar, named_tmp])
+        );
+        assert_eq!(
+            first
+                .candidates
+                .iter()
+                .find(|c| c.path == ordinary)
+                .unwrap()
+                .sources,
+            BTreeSet::from(Source::ALL)
+        );
+        assert!(
+            scanner.roots.contains_key(&nested),
+            "The excluded checkout's resolved root is cached too"
+        );
+        let reads = scanner.metadata_reads;
+        assert_eq!(scanner.scan(&f.locations(), [true; 3], &cancel), first);
+        assert_eq!(scanner.metadata_reads, reads);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn temporary_filter_follows_checkout_and_temp_root_symlinks() {
+        let f = Fixture::new();
+        let temporary = f.repo("system-temp/app");
+        let ordinary = f.repo("projects/app");
+        let temp_alias = f.0.join("temp-alias");
+        let checkout_alias = f.0.join("project-alias");
+        let ordinary_alias = f.0.join("system-temp/ordinary-alias");
+        std::os::unix::fs::symlink(f.0.join("system-temp"), &temp_alias).unwrap();
+        std::os::unix::fs::symlink(&temporary, &checkout_alias).unwrap();
+        std::os::unix::fs::symlink(&ordinary, &ordinary_alias).unwrap();
+        f.write("codex/sessions/temp.jsonl", &codex(&checkout_alias));
+        f.write("codex/sessions/ordinary.jsonl", &codex(&ordinary_alias));
+        let mut scanner = Scanner {
+            temporary_roots: TemporaryRoots::new([temp_alias]),
+            ..Scanner::default()
+        };
+        let snapshot = scanner.scan(&f.locations(), [true; 3], &AtomicBool::new(false));
+        assert_eq!(snapshot.candidates.len(), 1);
+        assert_eq!(snapshot.candidates[0].path, ordinary);
     }
     #[test]
     fn discovery_merges_sources_and_nested_paths_and_reuses_metadata() {
@@ -809,7 +856,7 @@ mod tests {
             "claude/projects/project/sessions-index.json",
             &serde_json::json!({"entries":[{"projectPath":root,"firstPrompt":"ignored"}]}),
         );
-        let mut scanner = Scanner::default();
+        let mut scanner = f.scanner();
         let cancel = AtomicBool::new(false);
         let snapshot = scanner.scan(&f.locations(), [true; 3], &cancel);
         assert_eq!(snapshot.candidates.len(), 1);
@@ -854,49 +901,30 @@ mod tests {
         f.write("codex/archived_sessions/good.jsonl", &codex(&root));
         let bad = f.0.join("codex/archived_sessions/bad.jsonl");
         fs::write(bad, b"{broken\n").unwrap();
-        let snapshot = Scanner::default().scan(&f.locations(), [true; 3], &AtomicBool::new(false));
+        let snapshot = f
+            .scanner()
+            .scan(&f.locations(), [true; 3], &AtomicBool::new(false));
         assert_eq!(snapshot.candidates.len(), 1);
         assert!(snapshot.errors[1].is_some());
         assert!(snapshot.errors[0].is_none());
         assert!(snapshot.errors[2].is_none());
     }
     #[test]
-    fn unavailable_paths_disabled_and_auto_add_respects_sources_and_exclusions() {
+    fn unavailable_and_non_git_paths_are_hidden() {
         let f = Fixture::new();
         let root = f.repo("repo");
         f.write("codex/sessions/a.jsonl", &codex(&root));
         fs::create_dir(f.0.join("not-git")).unwrap();
         f.write("codex/sessions/b.jsonl", &codex(&f.0.join("not-git")));
         f.write("codex/sessions/gone.jsonl", &codex(&f.0.join("gone")));
-        let snapshot = Scanner::default().scan(
+        let snapshot = f.scanner().scan(
             &f.locations(),
             [false, true, false],
             &AtomicBool::new(false),
         );
         assert_eq!(snapshot.candidates.len(), 1);
-        let valid = snapshot
-            .candidates
-            .iter()
-            .find(|c| c.error.is_none())
-            .unwrap();
-        let mut invalid = valid.clone();
-        invalid.error = Some("Unavailable".into());
-        let mut preferences = Preferences::default();
-        assert!(!preferences.should_add(valid));
-        preferences.automatic[1] = true;
-        assert!(preferences.should_add(valid));
-        assert!(!preferences.should_add(&invalid));
-        preferences.excluded.insert(root.clone());
-        assert!(!preferences.should_add(valid));
-        preferences.excluded.remove(&root);
-        assert!(preferences.should_add(valid));
-        preferences
-            .excluded_repositories
-            .insert(valid.repository.clone().unwrap());
-        assert!(
-            !preferences.should_add(valid),
-            "Repository removal also excludes newly discovered sibling checkouts"
-        );
+        assert_eq!(snapshot.candidates[0].path, root);
+        assert!(snapshot.candidates[0].error.is_none());
     }
     #[test]
     fn linked_worktrees_remain_distinct() {
@@ -933,7 +961,7 @@ mod tests {
         );
         f.write("codex/sessions/a.jsonl", &codex(&root));
         f.write("codex/sessions/b.jsonl", &codex(&checkout));
-        let snapshot = Scanner::default().scan(
+        let snapshot = f.scanner().scan(
             &f.locations(),
             [false, true, false],
             &AtomicBool::new(false),
@@ -1009,7 +1037,7 @@ mod tests {
         for n in 0..1000 {
             f.write(&format!("codex/sessions/{n}.jsonl"), &codex(&root));
         }
-        let mut scanner = Scanner::default();
+        let mut scanner = f.scanner();
         let cancel = AtomicBool::new(false);
         let first = scanner.scan(&f.locations(), [false, true, false], &cancel);
         assert_eq!(first.candidates.len(), 1);
@@ -1022,32 +1050,146 @@ mod tests {
         assert_eq!(scanner.metadata_reads, reads);
         eprintln!("Cached 1000-session discovery: {:?}", start.elapsed());
     }
+    fn modified(path: &Path, seconds: u64) -> SystemTime {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(time))
+            .unwrap();
+        time
+    }
     #[test]
-    fn newest_metadata_first_and_unavailable_directories_are_hidden() {
+    fn activity_orders_across_sources_and_updates_cached_and_removed_metadata() {
         let f = Fixture::new();
         let old = f.repo("a-old");
         let new = f.repo("z-new");
-        f.write("codex/sessions/old.jsonl", &codex(&old));
-        f.write("codex/sessions/new.jsonl", &codex(&new));
-        f.write("codex/sessions/missing.jsonl", &codex(&f.0.join("removed")));
-        let mut scanner = Scanner::default();
+        let old_session = f.write("codex/sessions/old.jsonl", &codex(&old));
+        let new_session = f.write(
+            "herdr/session.json",
+            &serde_json::json!({"version":3,"workspaces":[{"identity_cwd":new,"tabs":[]}]}),
+        );
+        let newest_session = f.write("claude/projects/old/session.jsonl", &serde_json::json!({"type":"user","cwd":old,"sessionId":"fixture","message":{"content":"ignored"}}));
+        modified(&old_session, 10);
+        modified(&new_session, 20);
+        let latest = modified(&newest_session, 30);
+        let mut scanner = f.scanner();
         let cancel = AtomicBool::new(false);
-        scanner.scan(&f.locations(), [false, true, false], &cancel);
-        scanner
-            .created
-            .insert(old.clone(), SystemTime::UNIX_EPOCH + Duration::from_secs(1));
-        scanner
-            .created
-            .insert(new.clone(), SystemTime::UNIX_EPOCH + Duration::from_secs(2));
-        let snapshot = scanner.scan(&f.locations(), [false, true, false], &cancel);
+        let scan = scanner.scan(&f.locations(), [true; 3], &cancel);
+        assert_eq!(
+            scan.candidates.iter().map(|c| &c.path).collect::<Vec<_>>(),
+            vec![&old, &new]
+        );
+        assert_eq!(scan.candidates[0].updated_at, Some(latest));
+        assert_eq!(
+            scan.candidates[0].sources,
+            BTreeSet::from([Source::Codex, Source::Claude])
+        );
+        let reads = scanner.metadata_reads;
+        assert_eq!(scanner.scan(&f.locations(), [true; 3], &cancel), scan);
+        assert_eq!(scanner.metadata_reads, reads);
+
+        // Touch an existing session without changing its creation time or cwd.
+        modified(&new_session, 40);
+        let scan = scanner.scan(&f.locations(), [true; 3], &cancel);
+        assert_eq!(scan.candidates[0].path, new);
+        assert_eq!(scanner.metadata_reads, reads + 1);
+
+        fs::remove_file(newest_session).unwrap();
+        let scan = scanner.scan(&f.locations(), [true; 3], &cancel);
+        assert_eq!(scan.candidates[1].path, old);
+        assert_eq!(
+            scan.candidates[1].updated_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10))
+        );
+        assert_eq!(scan.candidates[1].sources, BTreeSet::from([Source::Codex]));
+        assert_eq!(
+            scanner.metadata_reads,
+            reads + 1,
+            "Remaining metadata stays cached"
+        );
+    }
+    #[test]
+    fn equal_and_unknown_activity_use_name_then_path() {
+        let candidate = |path: &str, updated_at| Candidate {
+            path: path.into(),
+            repository: None,
+            error: None,
+            sources: BTreeSet::new(),
+            updated_at,
+        };
+        let known = Some(SystemTime::UNIX_EPOCH);
+        let mut snapshot = Snapshot {
+            candidates: vec![
+                candidate("/a/unknown", None),
+                candidate("/z/same", known),
+                candidate("/a/same", known),
+                candidate("/a/Alpha", known),
+            ],
+            errors: Default::default(),
+        };
+        snapshot.sort();
         assert_eq!(
             snapshot
                 .candidates
                 .iter()
-                .map(|c| c.path.clone())
+                .map(|c| c.path.to_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec![new, old]
+            vec!["/a/Alpha", "/a/same", "/z/same", "/a/unknown"]
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_nested_paths_merge_into_one_checkout() {
+        let f = Fixture::new();
+        let root = f.repo("repo");
+        let nested = root.join("src");
+        fs::create_dir(&nested).unwrap();
+        let link = f.0.join("alias");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        f.write("codex/sessions/nested.jsonl", &codex(&nested));
+        f.write("codex/sessions/alias.jsonl", &codex(&link));
+        let snapshot = f
+            .scanner()
+            .scan(&f.locations(), [true; 3], &AtomicBool::new(false));
+        assert_eq!(snapshot.candidates.len(), 1);
+        assert_eq!(snapshot.candidates[0].path, root);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn live_herdr_activity_uses_saved_metadata_and_never_poll_time() {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+        let f = Fixture::new();
+        let root = f.repo("repo");
+        let saved = f.write(
+            "herdr/session.json",
+            &serde_json::json!({"version":3,"workspaces":[]}),
+        );
+        let time = modified(&saved, 10);
+        let listener = UnixListener::bind(f.0.join("herdr/herdr.sock")).unwrap();
+        let checkout = root.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                writeln!(stream, "{}", serde_json::json!({"id":"diffy-discover","result":{"snapshot":{"workspaces":[{"worktree":{"checkout_path":checkout}}]}}})).unwrap();
+            }
+        });
+        let mut scanner = f.scanner();
+        let cancel = AtomicBool::new(false);
+        let snapshot = scanner.scan(&f.locations(), [true; 3], &cancel);
+        assert_eq!(snapshot.candidates[0].path, root);
+        assert_eq!(snapshot.candidates[0].updated_at, Some(time));
+        assert_eq!(scanner.scan(&f.locations(), [true; 3], &cancel), snapshot);
+        fs::remove_file(saved).unwrap();
+        let snapshot = scanner.scan(&f.locations(), [true; 3], &cancel);
+        assert_eq!(snapshot.candidates[0].updated_at, None);
+        server.join().unwrap();
     }
     #[test]
     fn legacy_codex_headers_without_cwd_are_normal_skips() {

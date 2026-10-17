@@ -118,7 +118,7 @@ fn main() {
             .filter(|s| s.role() == Some(Role::Tab))
             .filter_map(|s| s.label().map(str::to_owned))
             .collect::<Vec<_>>();
-        assert!(tabs.contains(&"Project".to_owned()), "{tabs:?}");
+        assert!(tabs.contains(&"main".to_owned()), "{tabs:?}");
         assert!(
             tabs.contains(&"Legacy task".to_owned()),
             "Legacy labels survive migration: {tabs:?}"
@@ -363,7 +363,7 @@ fn main() {
             .collect::<Vec<_>>();
         assert!(
             tabs.iter()
-                .any(|s| s.label() == Some("Project") && s.selected() == Some(true)),
+                .any(|s| s.label() == Some("main") && s.selected() == Some(true)),
             "Main project selection survives restart"
         );
         window.press("secondary-right", cx);

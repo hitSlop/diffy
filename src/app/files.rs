@@ -98,6 +98,27 @@ impl Diffy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<InputState>> {
+        if self.is_pr() {
+            let key = self.github_key()?;
+            if let Some(search) = self.active_view()?.search.clone() {
+                return Some(search);
+            }
+            let search = cx.new(|cx| InputState::new(window, cx).placeholder("Find file"));
+            self.active_view_mut()?.search = Some(search.clone());
+            let subscription = cx.subscribe(&search, move |this, input, event, cx| {
+                if matches!(event, InputEvent::Change)
+                    && let Some(state) = this.github.states.get_mut(&key)
+                {
+                    state.view.set_query(input.read(cx).value().to_string(), cx);
+                }
+            });
+            self.github
+                .states
+                .get_mut(&self.github_key()?)
+                .unwrap()
+                .add_subscription(subscription);
+            return Some(search);
+        }
         let project = self.projects.get(self.active)?;
         if let Some(search) = project.view().search.clone() {
             return Some(search);
@@ -125,13 +146,14 @@ impl Diffy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.ensure_github_repository(window, cx);
         let Some(search) = self.ensure_file_search(window, cx) else {
             return div().size_full().bg(rgb(0)).into_any_element();
         };
         let Some(p) = self.projects.get(self.active) else {
             return div().size_full().bg(rgb(0)).into_any_element();
         };
-        let view = p.view();
+        let view = self.active_view().unwrap();
         let files = view.files.clone();
         let rows = view.rows.clone();
         let sidebar = view.sidebar.clone();
@@ -141,8 +163,8 @@ impl Diffy {
         let owner = cx.entity().downgrade();
         let project_id = p.id;
         let group = p.group;
-        let local = p.path.is_some();
-        let disabled = p.path.is_none() || p.loading;
+        let local = p.path.is_some() && !self.is_pr();
+        let disabled = !local || p.loading;
         let files_focused = view.focus.contains_focused(window, cx);
         v_flex()
             .size_full()
@@ -158,7 +180,7 @@ impl Diffy {
                         div()
                             .font_medium()
                             .text_size(px(14.))
-                            .child(p.group.label()),
+                            .child(if self.is_pr() { "Files" } else { p.group.label() }),
                     )
                     .child(
                         div()
@@ -334,7 +356,7 @@ impl Diffy {
                                                         .text_color(color)
                                                         .child(status),
                                                 )
-                                                .child(
+                                                .when(local, |row| row.child(
                                                     Button::new(("file-action", index))
                                                         .ghost()
                                                         .xsmall()
@@ -373,7 +395,7 @@ impl Diffy {
                                                                 },
                                                             );
                                                         }),
-                                                ),
+                                                )),
                                         )
                                         .on_click(move |_, window, cx| {
                                             let _ = owner.update(cx, |this, cx| {
@@ -404,7 +426,7 @@ impl Diffy {
                     })
                     .vertical_scrollbar(&view.scroll),
             )
-            .child(
+            .when(local, |list| list.child(
                 div().flex_none().px_3().py_3().child(
                     Button::new("stage-all")
                         .ghost()
@@ -422,7 +444,7 @@ impl Diffy {
                         .disabled(disabled || view.files.is_empty())
                         .on_click(cx.listener(|this, _, _, cx| this.stage_all(cx))),
                 ),
-            )
+            ))
             .into_any_element()
     }
     pub(super) fn focus_file_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -430,11 +452,7 @@ impl Diffy {
             return;
         }
         self.stop_file_repeat();
-        let Some(search) = self
-            .projects
-            .get(self.active)
-            .and_then(|project| project.view().search.clone())
-        else {
+        let Some(search) = self.active_view().and_then(|view| view.search.clone()) else {
             return;
         };
         search.update(cx, |input, cx| {
@@ -448,10 +466,9 @@ impl Diffy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(p) = self.projects.get_mut(self.active) else {
+        let Some(view) = self.active_view_mut() else {
             return;
         };
-        let view = p.view_mut();
         view.select(path, cx);
         view.focus.focus(window, cx);
         self.ensure_preview(cx);
@@ -460,14 +477,13 @@ impl Diffy {
     }
     pub(super) fn move_file(&mut self, direction: isize, cx: &mut Context<Self>) {
         let Some(ix) = self
-            .projects
-            .get(self.active)
-            .and_then(|project| project.view().step_visible(direction))
+            .active_view()
+            .and_then(|view| view.step_visible(direction))
         else {
             return;
         };
-        let path = self.projects[self.active].view().files[ix].path().clone();
-        self.projects[self.active].view_mut().select(path, cx);
+        let path = self.active_view().unwrap().files[ix].path().clone();
+        self.active_view_mut().unwrap().select(path, cx);
         self.ensure_preview(cx);
         self.persist_navigation(cx);
         cx.notify();
@@ -666,9 +682,7 @@ impl Diffy {
         self.file_key_probe = probe;
     }
     pub fn selected_file(&self) -> Option<&SharedString> {
-        self.projects
-            .get(self.active)
-            .and_then(|p| p.view().selected.as_ref())
+        self.active_view().and_then(|v| v.selected.as_ref())
     }
 }
 

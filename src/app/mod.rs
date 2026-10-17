@@ -32,6 +32,7 @@ use gpui_kit::{Action, AsKeystroke as _, KeyBinding, KeyContext, Pixels};
 use std::path::PathBuf;
 
 mod files;
+mod github_review;
 mod import;
 mod notice;
 mod palette;
@@ -189,6 +190,7 @@ pub fn init(cx: &mut App) {
 pub struct Diffy {
     window_handle: gpui_kit::AnyWindowHandle,
     import: import::Runtime,
+    github: github_review::Runtime,
     projects: Vec<session::Project>,
     repositories: Vec<worktrees::RepositoryProject>,
     topology_sequence: u64,
@@ -268,15 +270,19 @@ impl Render for Diffy {
             .child(hint(&[&PreviousProject, &NextProject], "Projects"))
             .child(hint(&[&PreviousFile, &NextFile], "Files"))
             .child(hint(&[&FocusFileSearch], "Find"))
-            .child(hint(&[&ToggleGroup], "View"))
-            .child(hint(
-                &[&StageFile],
-                if self.selected_group() == ChangeGroup::Staged {
-                    "Unstage"
-                } else {
-                    "Stage"
-                },
-            ));
+            .when(!self.is_pr(), |row| {
+                row.child(hint(&[&ToggleGroup], "View"))
+            })
+            .when(!self.is_pr(), |row| {
+                row.child(hint(
+                    &[&StageFile],
+                    if self.selected_group() == ChangeGroup::Staged {
+                        "Unstage"
+                    } else {
+                        "Stage"
+                    },
+                ))
+            });
         let breadcrumb = p.map(|p| {
             let path = p.path.as_ref().map_or_else(
                 || p.name.to_string(),
@@ -298,7 +304,18 @@ impl Render for Diffy {
                 .text_color(cx.theme().muted_foreground)
                 .child(div().min_w_0().truncate().child(path))
                 .child("/")
-                .child(div().flex_none().child(p.branch.clone()))
+                .child(div().flex_none().child(if self.is_pr() {
+                    self.pr_state()
+                        .and_then(|s| {
+                            s.repository.as_ref().map(|r| {
+                                s.selected
+                                    .map_or_else(|| r.label(), |n| format!("{} #{}", r.label(), n))
+                            })
+                        })
+                        .unwrap_or_else(|| "Pull requests".into())
+                } else {
+                    p.branch.to_string()
+                }))
         });
         v_flex()
             .id("diffy")

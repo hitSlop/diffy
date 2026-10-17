@@ -29,6 +29,11 @@ Diffy uses gix 0.89.0 (MIT/Apache-2.0) for the opt-in read-only repository metad
 
 - gix: https://github.com/GitoxideLabs/gitoxide
 
+Diffy uses Octocrab 0.54.5 (MIT/Apache-2.0) for read-only GitHub pull request access, with Tokio for asynchronous networking. The packaged dependency inventory includes their licenses.
+
+- Octocrab: https://github.com/XAMPPRocky/octocrab
+- Tokio: https://github.com/tokio-rs/tokio
+
 Diffy uses cargo-packager (MIT/Apache-2.0) for packaging and cargo-packager-updater (MIT/Apache-2.0) for signed updates. The updater is pinned to revision `0a3ea3a089363b7e77dfca238be5bbcf3f4d75f6` for HTTPS enforcement.
 
 - Source: https://github.com/crabnebula-dev/cargo-packager

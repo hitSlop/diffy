@@ -133,6 +133,7 @@ impl Diffy {
         let mut this = Self {
             window_handle: window.window_handle(),
             import: Default::default(),
+            github: Default::default(),
             projects: Vec::new(),
             repositories: Vec::new(),
             topology_sequence: 0,
@@ -324,7 +325,6 @@ impl Diffy {
         }));
         if !demo && this.state_path.is_some() && !this.state_restore_failed {
             cx.defer_in(window, |this, window, cx| {
-                this.start_discovery(window, cx);
                 if !this.import.preferences.onboarding_completed {
                     this.open_import(window, cx);
                 }
@@ -561,6 +561,8 @@ impl Diffy {
             if !self.projects[ix].available {
                 return;
             }
+            self.stop_file_repeat();
+            self.leave_github(cx);
             self.active = ix;
             self.remember_worktree();
             self.reveal_worktree();
@@ -588,6 +590,7 @@ impl Diffy {
                 .preferences
                 .excluded_repositories
                 .insert(common.clone());
+            self.github.states.remove(&common);
             self.repositories.retain(|r| r.common_dir != common);
         }
         for p in &self.projects {
@@ -629,6 +632,9 @@ impl Diffy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_pr() {
+            return;
+        }
         let Some(p) = self.projects.get_mut(self.active) else {
             return;
         };

@@ -14,6 +14,9 @@ impl Diffy {
         absolute: bool,
         cx: &mut Context<Self>,
     ) {
+        if absolute && self.is_pr() {
+            return;
+        }
         let Some(p) = self.projects.iter().find(|p| p.id == id) else {
             return;
         };
@@ -28,6 +31,9 @@ impl Diffy {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
     pub(super) fn reveal_file_path(&self, id: u64, path: &str, cx: &mut Context<Self>) {
+        if self.is_pr() {
+            return;
+        }
         if let Some(p) = self.projects.iter().find(|p| p.id == id)
             && let Some(root) = &p.path
             && let Some(path) = reveal_target(&root.join(path))
@@ -36,10 +42,13 @@ impl Diffy {
         }
     }
     pub(super) fn copy_path(&self, absolute: bool, cx: &mut Context<Self>) {
+        if absolute && self.is_pr() {
+            return;
+        }
         let Some(p) = self.projects.get(self.active) else {
             return;
         };
-        let Some(file) = p.view().selected_entry() else {
+        let Some(file) = self.active_view().and_then(|v| v.selected_entry()) else {
             return;
         };
         let text = if absolute {
@@ -53,10 +62,13 @@ impl Diffy {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
     pub(super) fn reveal_file(&self, cx: &mut Context<Self>) {
+        if self.is_pr() {
+            return;
+        }
         let Some(p) = self.projects.get(self.active) else {
             return;
         };
-        let Some(file) = p.view().selected_entry() else {
+        let Some(file) = self.active_view().and_then(|v| v.selected_entry()) else {
             return;
         };
         if let Some(root) = &p.path
@@ -88,9 +100,8 @@ impl Diffy {
         self.preview_requests
     }
     pub fn selected_preview_path(&self) -> Option<&gpui_kit::SharedString> {
-        self.projects
-            .get(self.active)
-            .and_then(|p| p.view().selected_file())
+        self.active_view()
+            .and_then(|v| v.selected_file())
             .map(|f| f.path())
     }
     pub fn preferences_flush(&self) -> Option<crate::state::Flush> {
@@ -99,9 +110,7 @@ impl Diffy {
             .map(crate::state::Writer::flush_handle)
     }
     pub fn selected_top_line(&self, cx: &gpui_kit::App) -> Option<usize> {
-        self.projects
-            .get(self.active)?
-            .view()
+        self.active_view()?
             .diff
             .read(cx)
             .reading_position()

@@ -3,6 +3,7 @@ pub mod cli;
 pub mod demo;
 pub mod discovery;
 pub mod fonts;
+pub mod github;
 pub mod instance;
 mod keyboard;
 pub mod profiling;

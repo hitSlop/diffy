@@ -321,6 +321,36 @@ mod tests {
         assert_eq!(saved.projects[0].icon, None);
     }
     #[test]
+    fn retired_auto_import_flags_preserve_projects_and_exclusions() {
+        let saved: SavedState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "projects": [{"path":"/tmp/example","color":1,"staged":false,"split":true,"selected":[null,null]}],
+            "active": "/tmp/example",
+            "discovery": {
+                "automatic": [true, true, true],
+                "onboarding_completed": true,
+                "excluded": ["/tmp/skipped"],
+                "excluded_repositories": ["/tmp/removed/.git"]
+            }
+        })).unwrap();
+        assert_eq!(saved.projects.len(), 1);
+        assert_eq!(saved.active, Some(PathBuf::from("/tmp/example")));
+        assert!(saved.discovery.onboarding_completed);
+        assert!(saved.discovery.excluded.contains(Path::new("/tmp/skipped")));
+        assert!(
+            saved
+                .discovery
+                .excluded_repositories
+                .contains(Path::new("/tmp/removed/.git"))
+        );
+        let serialized = serde_json::to_value(&saved).unwrap();
+        assert!(serialized["discovery"].get("automatic").is_none());
+        assert_eq!(
+            serde_json::from_value::<SavedState>(serialized).unwrap(),
+            saved
+        );
+    }
+    #[test]
     fn optional_future_fields_do_not_hide_saved_projects() {
         let saved: SavedState = serde_json::from_str(r#"{"version":1,"projects":[{"path":"/tmp/example","color":1,"staged":false,"split":true,"selected":[null,null],"future_option":true}],"active":null,"future_reader_option":{"enabled":true}}"#).unwrap();
         assert_eq!(saved.projects.len(), 1);

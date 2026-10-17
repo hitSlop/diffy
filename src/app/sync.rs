@@ -14,7 +14,7 @@ impl Diffy {
         mutation: Option<(Vec<ChangedFile>, bool)>,
         cx: &mut Context<Self>,
     ) {
-        if mutation.is_some() && self.updates.blocks_mutations() {
+        if mutation.is_some() && (self.updates.blocks_mutations() || self.is_pr()) {
             return;
         }
         if mutation.is_some()
@@ -170,6 +170,19 @@ impl Diffy {
         }
     }
     pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.is_pr() {
+            self.list_prs(false, cx);
+            return;
+        }
+        if let Some(key) = self.github_key()
+            && self
+                .github
+                .states
+                .get(&key)
+                .is_some_and(|s| !s.resolving && s.remotes.is_empty())
+        {
+            self.github.states.remove(&key);
+        }
         if let Some(id) = self.active_project_id() {
             self.discover_worktrees(id, true, cx);
         }
@@ -256,7 +269,7 @@ impl Diffy {
         }));
     }
     pub(super) fn stage_file(&mut self, cx: &mut Context<Self>) {
-        if self.updates.blocks_mutations() {
+        if self.updates.blocks_mutations() || self.is_pr() {
             return;
         }
         let Some(p) = self.projects.get(self.active) else {
@@ -270,7 +283,7 @@ impl Diffy {
         }
     }
     pub(super) fn stage_all(&mut self, cx: &mut Context<Self>) {
-        if self.updates.blocks_mutations() {
+        if self.updates.blocks_mutations() || self.is_pr() {
             return;
         }
         let Some(p) = self.projects.get(self.active) else {
@@ -299,6 +312,9 @@ impl Diffy {
         path: &SharedString,
         cx: &mut Context<Self>,
     ) {
+        if self.is_pr() {
+            return;
+        }
         let Some(ix) = self.projects.iter().position(|p| p.id == id) else {
             return;
         };
@@ -347,6 +363,16 @@ impl Diffy {
         }
     }
     pub(super) fn ensure_preview(&mut self, cx: &mut Context<Self>) {
+        let active_key = self.github_key();
+        for (key, state) in &mut self.github.states {
+            if Some(key) != active_key.as_ref() {
+                state.cancel(cx);
+            }
+        }
+        if self.is_pr() {
+            self.ensure_pr_preview(cx);
+            return;
+        }
         for (index, project) in self.projects.iter_mut().enumerate() {
             if project.path.is_none() {
                 continue;
@@ -448,9 +474,8 @@ impl Diffy {
             .is_some_and(|p| p.watcher.is_some())
     }
     pub fn selected_additions(&self) -> usize {
-        self.projects
-            .get(self.active)
-            .and_then(|p| p.view().selected_file())
+        self.active_view()
+            .and_then(|v| v.selected_file())
             .map_or(0, |f| f.additions())
     }
 }

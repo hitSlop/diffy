@@ -142,6 +142,12 @@ impl ReviewView {
         }
     }
 
+    pub(super) fn clear(&mut self, cx: &mut Context<Diffy>) {
+        self.demos.clear();
+        self.selected = None;
+        self.reset_selection(cx);
+        self.install_metadata(Vec::new(), 0, cx);
+    }
     pub(super) fn loaded(&self) -> bool {
         self.loaded
     }

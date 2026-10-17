@@ -8,6 +8,7 @@ use gpui_kit::InteractiveElement as _;
 use gpui_kit::IntoElement;
 use gpui_kit::MouseButton;
 use gpui_kit::ParentElement as _;
+use gpui_kit::StatefulInteractiveElement as _;
 use gpui_kit::Styled as _;
 use gpui_kit::Window;
 use gpui_kit::base::TestSupportExt as _;
@@ -25,6 +26,7 @@ use gpui_kit::component::diff::DiffMode;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::toolbar::Toolbar;
 use gpui_kit::component::v_flex;
 use gpui_kit::div;
@@ -65,7 +67,8 @@ impl Diffy {
         let Some(project) = self.projects.get(self.active) else {
             return false;
         };
-        project.view().files.is_empty()
+        !self.is_pr()
+            && project.view().files.is_empty()
             && !project.loading
             && self.settings.is_none()
             && !self.palette_open
@@ -129,7 +132,9 @@ impl Diffy {
                 )
                 .into_any_element();
         };
-        let view = p.view();
+        let remote = self.is_pr();
+        let pr_loading = self.pr_state().and_then(|s| s.loading_message());
+        let view = self.active_view().unwrap();
         let mode = view.diff.read(cx).mode();
         let empty = view.files.is_empty();
         let scope_buttons = [ChangeGroup::Staged, ChangeGroup::Changes].map(|group| {
@@ -165,7 +170,62 @@ impl Diffy {
                     .flex_none()
                     .px_3()
                     .gap_1()
-                    .contents(scope_buttons.map(IntoElement::into_any_element))
+                    .contents(if remote {
+                        Vec::new()
+                    } else {
+                        scope_buttons
+                            .into_iter()
+                            .map(IntoElement::into_any_element)
+                            .collect::<Vec<_>>()
+                    })
+                    .when(remote, |toolbar| {
+                        toolbar
+                            .content(if let Some(message) = pr_loading {
+                                h_flex()
+                                    .id("pr-loading-status")
+                                    .test_support()
+                                    .role(gpui_kit::Role::Status)
+                                    .aria_label(message)
+                                    .min_w_0()
+                                    .max_w(px(320.))
+                                    .gap_2()
+                                    .text_size(px(12.))
+                                    .child(Spinner::new().xsmall())
+                                    .child(div().truncate().child(message))
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .max_w(px(320.))
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .child(
+                                        self.pr_state()
+                                            .and_then(|s| {
+                                                s.prs.iter().find(|p| Some(p.number) == s.selected)
+                                            })
+                                            .map(|p| {
+                                                format!(
+                                                    "#{} · {} → {}{}",
+                                                    p.number,
+                                                    p.head,
+                                                    p.base,
+                                                    if p.draft { " · Draft" } else { "" }
+                                                )
+                                            })
+                                            .unwrap_or_else(|| "Pull requests".into()),
+                                    )
+                                    .into_any_element()
+                            })
+                            .content(
+                                Button::new("open-pr-github")
+                                    .ghost()
+                                    .small()
+                                    .label("Open in GitHub")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.open_pr_browser(cx)),
+                                    ),
+                            )
+                    })
                     .content(
                         div()
                             .id("toolbar-drag-area")
@@ -227,7 +287,14 @@ impl Diffy {
                             .ghost()
                             .small()
                             .icon(IconName::RotateCw)
-                            .disabled(p.path.is_none() || p.loading)
+                            .loading(pr_loading.is_some())
+                            .disabled(if remote {
+                                self.pr_state().is_none_or(|s| {
+                                    s.listing || s.loading || s.repository.is_none()
+                                })
+                            } else {
+                                p.path.is_none() || p.loading
+                            })
                             .tooltip(super::shortcut_label(&super::Refresh, window, "Refresh"))
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     ),
@@ -251,7 +318,7 @@ impl Diffy {
                             .context_menu({
                                 let id = p.id;
                                 let path = view.selected.clone().unwrap_or_default();
-                                let local = p.path.is_some();
+                                let local = p.path.is_some() && !remote;
                                 move |menu, _, _| {
                                     super::reader::file_menu(menu, id, path.as_str(), local)
                                 }
@@ -272,71 +339,80 @@ impl Diffy {
                                     .child(format!("−{}", f.deletions())),
                             )
                     }))
-                    .child(
-                        Button::new("stage-file")
-                            .ghost()
-                            .xsmall()
-                            .icon(if p.group == ChangeGroup::Changes {
-                                IconName::Plus
-                            } else {
-                                IconName::Minus
-                            })
-                            .accessibility_label(if p.group == ChangeGroup::Changes {
-                                "Stage file"
-                            } else {
-                                "Unstage file"
-                            })
-                            .when(
-                                !view
-                                    .diff
-                                    .read(cx)
-                                    .focus_handle(cx)
-                                    .contains_focused(window, cx),
-                                |button| {
-                                    button
-                                        .invisible()
-                                        .group_hover("preview-header", |button| button.visible())
-                                },
-                            )
-                            .disabled(
-                                empty
-                                    || p.path.is_none()
-                                    || p.loading
-                                    || view.selected_entry().is_some_and(|e| !e.stageable()),
-                            )
-                            .tooltip(if p.path.is_none() {
-                                "Open a repository to stage files".to_owned()
-                            } else {
-                                super::shortcut_label(
-                                    &super::StageFile,
-                                    window,
-                                    "Stage / unstage file",
+                    .when(!remote, |row| {
+                        row.child(
+                            Button::new("stage-file")
+                                .ghost()
+                                .xsmall()
+                                .icon(if p.group == ChangeGroup::Changes {
+                                    IconName::Plus
+                                } else {
+                                    IconName::Minus
+                                })
+                                .accessibility_label(if p.group == ChangeGroup::Changes {
+                                    "Stage file"
+                                } else {
+                                    "Unstage file"
+                                })
+                                .when(
+                                    !view
+                                        .diff
+                                        .read(cx)
+                                        .focus_handle(cx)
+                                        .contains_focused(window, cx),
+                                    |button| {
+                                        button.invisible().group_hover("preview-header", |button| {
+                                            button.visible()
+                                        })
+                                    },
                                 )
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.stage_file(cx))),
-                    ),
+                                .disabled(
+                                    empty
+                                        || p.path.is_none()
+                                        || p.loading
+                                        || view.selected_entry().is_some_and(|e| !e.stageable()),
+                                )
+                                .tooltip(if p.path.is_none() {
+                                    "Open a repository to stage files".to_owned()
+                                } else {
+                                    super::shortcut_label(
+                                        &super::StageFile,
+                                        window,
+                                        "Stage / unstage file",
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.stage_file(cx))),
+                        )
+                    }),
             )
-            .children(p.error.as_ref().map(|error| {
-                h_flex()
-                    .px_4()
-                    .py_2()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.))
-                            .text_color(cx.theme().danger)
-                            .child(error.clone()),
-                    )
-                    .child(
-                        Button::new("retry")
-                            .ghost()
-                            .small()
-                            .label("Retry")
-                            .disabled(p.loading)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    )
-            }))
+            .children(
+                (if remote {
+                    self.pr_state().and_then(|s| s.error.as_ref())
+                } else {
+                    p.error.as_ref()
+                })
+                .map(|error| {
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(13.))
+                                .text_color(cx.theme().danger)
+                                .child(error.clone()),
+                        )
+                        .child(
+                            Button::new("retry")
+                                .ghost()
+                                .small()
+                                .label("Retry")
+                                .disabled(p.loading)
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                        )
+                }),
+            )
             .children(view.preview_error.as_ref().map(|error| {
                 h_flex()
                     .px_3()
@@ -360,16 +436,22 @@ impl Diffy {
                     .child("Unmerged file · resolve and stage outside Diffy")
             }))
             .child(if !empty && view.preview.is_none() {
-                div()
+                v_flex()
                     .flex_1()
-                    .flex()
                     .items_center()
                     .justify_center()
                     .text_color(cx.theme().muted_foreground)
+                    .gap_2()
+                    .children(pr_loading.map(|_| {
+                        div()
+                            .id("pr-loading-empty")
+                            .test_support()
+                            .child(Spinner::new().small())
+                    }))
                     .child(if view.preview_error.is_some() && !view.preview_loading {
                         "Preview unavailable"
                     } else {
-                        "Loading preview…"
+                        pr_loading.unwrap_or("Loading preview…")
                     })
                     .into_any_element()
             } else if empty {
@@ -393,7 +475,16 @@ impl Diffy {
                         .items_center()
                         .justify_center()
                         .text_color(cx.theme().muted_foreground)
-                        .child(if p.loading {
+                        .gap_2()
+                        .children(pr_loading.map(|_| {
+                            div()
+                                .id("pr-loading-empty")
+                                .test_support()
+                                .child(Spinner::new().small())
+                        }))
+                        .child(if remote {
+                            pr_loading.unwrap_or_else(|| self.pr_empty_message())
+                        } else if p.loading {
                             "Reading changes…"
                         } else if p.group == ChangeGroup::Staged {
                             "No staged files"
@@ -425,6 +516,13 @@ impl Diffy {
             .into_any_element()
     }
     pub(super) fn set_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
+        if self.is_pr() {
+            if let Some(view) = self.active_view() {
+                view.diff.update(cx, |d, cx| d.set_mode(mode, cx));
+            }
+            cx.notify();
+            return;
+        }
         let Some(p) = self.projects.get(self.active) else {
             return;
         };
@@ -434,10 +532,10 @@ impl Diffy {
         self.persist(cx);
     }
     pub(super) fn change(&mut self, next: bool, cx: &mut Context<Self>) {
-        let Some(p) = self.projects.get(self.active) else {
+        let Some(view) = self.active_view() else {
             return;
         };
-        p.view().diff.update(cx, |d, cx| {
+        view.diff.update(cx, |d, cx| {
             if next {
                 d.next_change(cx)
             } else {
@@ -446,13 +544,12 @@ impl Diffy {
         });
     }
     pub(super) fn focus_diff(&self, window: &mut Window, cx: &mut App) {
-        if let Some(p) = self.projects.get(self.active) {
-            p.view().diff.read(cx).focus_handle(cx).focus(window, cx);
+        if let Some(view) = self.active_view() {
+            view.diff.read(cx).focus_handle(cx).focus(window, cx);
         }
     }
     pub fn selected_mode(&self, cx: &App) -> DiffMode {
-        self.projects
-            .get(self.active)
-            .map_or(DiffMode::Unified, |p| p.view().diff.read(cx).mode())
+        self.active_view()
+            .map_or(DiffMode::Unified, |view| view.diff.read(cx).mode())
     }
 }
